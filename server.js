@@ -1,8 +1,11 @@
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const { db, User, Project, Task } = require('./database/setup');
+const { body, validationResult } = require('express-validator');
 require('dotenv').config();
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,7 +15,7 @@ app.use(express.json());
 
 // Session middleware (TODO: Replace with JWT)
 app.use(session({
-    secret: process.env.SESSION_SECRET,
+    secret: process.env.JWT_SECRET,
     resave: false,
     saveUninitialized: false,
     cookie: { 
@@ -23,19 +26,60 @@ app.use(session({
 
 // TODO: Create JWT middleware to replace session auth
 function requireAuth(req, res, next) {
-    if (req.session && req.session.userId) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const token = authHeader.substring(7);
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
         req.user = {
-            id: req.session.userId,
-            name: req.session.userName,
-            email: req.session.userEmail
+            id: decoded.id,
+            name: decoded.name,
+            email: decoded.email,
+            role: decoded.role
         };
+
         next();
-    } else {
-        res.status(401).json({ 
-            error: 'Authentication required. Please log in.' 
-        });
+    } catch (error) {
+        if (error.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Token expired' });
+        } else if (error.name === 'JsonWebTokenError') {
+            return res.status(401).json({ error: 'Invalid token' });
+        } else {
+            return res.status(401).json({ error: 'Failed to authenticate token' });
+        }
     }
 }
+
+function requireManager(req, res, next) {
+    if (!req.user) {
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    if (req.user.role === 'manager' || req.user.role === 'admin') {
+        next();
+    } else {
+        return res.status(403).json({ error: 'Access Denied. Manager or Admin Role Required' });
+    }
+}
+
+function requireAdmin(req, res, next) {
+    if (!req.user) {
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    if (req.user.role === 'admin') {
+        next();
+    } else {
+        return res.status(403).json({ error: 'Access Denied. Admin Role Required' });
+    }
+}
+
 
 // Test database connection
 async function testConnection() {
@@ -49,12 +93,56 @@ async function testConnection() {
 
 testConnection();
 
+// Validation
+const validateProject = [
+    body('name').notEmpty().withMessage('Project name is required'),
+    body('description').optional().isString().withMessage('Description must be a string'),
+    body('status').notEmpty().isIn(['active', 'planning', 'completed']).withMessage('Project status is required')
+];
+
+const validateTask = [
+    body('title').notEmpty().isString().withMessage('Task title is required'),
+    body('description').optional().isString().withMessage('Description must be a string'),
+    body('status').notEmpty().isIn(['pending', 'in-progress', 'completed']).withMessage('Task status is required'),
+    body('priority').notEmpty().isIn(['low', 'medium', 'high']).withMessage('Task priority is required')
+];
+
+const validateLogin = [
+    body('email').notEmpty().isEmail().withMessage('Valid email is required'),
+    body('password').notEmpty().isLength({ min: 6 }).withMessage('Password must be at least 6 characters long')
+];
+
+const validateRegister = [
+    body('name').notEmpty().isString().withMessage('Name is required'),
+    body('email').notEmpty().isEmail().withMessage('Valid email is required'),
+    body('password').notEmpty().isLength({ min: 6 }).withMessage('Password must be at least 6 characters long'),
+    body('role').notEmpty().isIn(['employee', 'manager', 'admin']).withMessage('Role is required')
+];
+
+const handleValidationErrors = (req, res, next) => {
+    const errors = validationResult(req);
+
+    if (!errors.isEmpty()) {
+        const errorMessages = errors.array().map(err => err.msg);
+        return res.status(400).json({
+            error: 'Validation failed',
+            messages: errorMessages
+        });
+    }
+
+    if(req.body.completed !== undefined) {
+        req.body.completed = false;
+    }
+
+    next();
+}
+
 // AUTHENTICATION ROUTES
 
 // POST /api/register - Register new user
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', validateRegister, handleValidationErrors, async (req, res) => {
     try {
-        const { name, email, password } = req.body;
+        const { name, email, password, role } = req.body;
         
         // Check if user exists
         const existingUser = await User.findOne({ where: { email } });
@@ -69,8 +157,9 @@ app.post('/api/register', async (req, res) => {
         const newUser = await User.create({
             name,
             email,
-            password: hashedPassword
+            password: hashedPassword,
             // TODO: Add role field
+            role: role
         });
         
         res.status(201).json({
@@ -78,7 +167,8 @@ app.post('/api/register', async (req, res) => {
             user: {
                 id: newUser.id,
                 name: newUser.name,
-                email: newUser.email
+                email: newUser.email,
+                role: newUser.role
             }
         });
         
@@ -89,7 +179,7 @@ app.post('/api/register', async (req, res) => {
 });
 
 // POST /api/login - User login (TODO: Replace with JWT)
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', validateLogin, handleValidationErrors, async (req, res) => {
     try {
         const { email, password } = req.body;
         
@@ -104,16 +194,25 @@ app.post('/api/login', async (req, res) => {
         }
         
         // Create session (TODO: Replace with JWT)
-        req.session.userId = user.id;
-        req.session.userName = user.name;
-        req.session.userEmail = user.email;
+        const token = jwt.sign(
+            {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRES_IN }
+        );
         
         res.json({
             message: 'Login successful',
+            token: token,
             user: {
                 id: user.id,
                 name: user.name,
-                email: user.email
+                email: user.email,
+                role: user.role
             }
         });
         
@@ -154,7 +253,7 @@ app.get('/api/users/profile', requireAuth, async (req, res) => {
 });
 
 // GET /api/users - Get all users (TODO: Admin only)
-app.get('/api/users', requireAuth, async (req, res) => {
+app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
     try {
         const users = await User.findAll({
             attributes: ['id', 'name', 'email'] // Don't return passwords
@@ -224,7 +323,7 @@ app.get('/api/projects/:id', requireAuth, async (req, res) => {
 });
 
 // POST /api/projects - Create new project (TODO: Manager+ only)
-app.post('/api/projects', requireAuth, async (req, res) => {
+app.post('/api/projects', requireAuth, validateProject, handleValidationErrors, requireManager, async (req, res) => {
     try {
         const { name, description, status = 'active' } = req.body;
         
@@ -243,7 +342,7 @@ app.post('/api/projects', requireAuth, async (req, res) => {
 });
 
 // PUT /api/projects/:id - Update project (TODO: Manager+ only)
-app.put('/api/projects/:id', requireAuth, async (req, res) => {
+app.put('/api/projects/:id', requireAuth, validateProject, handleValidationErrors, requireManager, async (req, res) => {
     try {
         const { name, description, status } = req.body;
         
@@ -265,7 +364,7 @@ app.put('/api/projects/:id', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/projects/:id - Delete project (TODO: Admin only)
-app.delete('/api/projects/:id', requireAuth, async (req, res) => {
+app.delete('/api/projects/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const deletedRowsCount = await Project.destroy({
             where: { id: req.params.id }
@@ -306,7 +405,7 @@ app.get('/api/projects/:id/tasks', requireAuth, async (req, res) => {
 });
 
 // POST /api/projects/:id/tasks - Create task (TODO: Manager+ only)
-app.post('/api/projects/:id/tasks', requireAuth, async (req, res) => {
+app.post('/api/projects/:id/tasks', requireAuth, validateTask, handleValidationErrors, requireManager, async (req, res) => {
     try {
         const { title, description, assignedUserId, priority = 'medium' } = req.body;
         
@@ -327,7 +426,7 @@ app.post('/api/projects/:id/tasks', requireAuth, async (req, res) => {
 });
 
 // PUT /api/tasks/:id - Update task
-app.put('/api/tasks/:id', requireAuth, async (req, res) => {
+app.put('/api/tasks/:id', requireAuth, validateTask, handleValidationErrors, async (req, res) => {
     try {
         const { title, description, status, priority } = req.body;
         
@@ -349,7 +448,7 @@ app.put('/api/tasks/:id', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/tasks/:id - Delete task (TODO: Manager+ only)
-app.delete('/api/tasks/:id', requireAuth, async (req, res) => {
+app.delete('/api/tasks/:id', requireAuth, requireManager, async (req, res) => {
     try {
         const deletedRowsCount = await Task.destroy({
             where: { id: req.params.id }
